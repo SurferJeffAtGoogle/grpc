@@ -46,19 +46,30 @@
     }                                                            \
   } while (0)
 
+#define WINPIPE_LOG_ERROR(error)                                 \
+  do {                                                           \
+    if (GRPC_TRACER_ON(grpc_winpipe_trace)) {                    \
+      char* last_error = GetErrorString(error);                  \
+      WINPIPE_LOG(GPR_ERROR, last_error);                        \
+      LocalFree(last_error);                                     \
+    }                                                            \
+  } while (0)
 
 char* GetLastErrorString()
 {
+  return GetErrorString(GetLastError());
+}
+
+char* GetErrorString(DWORD error)
+{
   // Retrieve the system error message for the last-error code
   char* message_buffer;
-  DWORD last_error = GetLastError();
-
   FormatMessageA(
     FORMAT_MESSAGE_ALLOCATE_BUFFER |
     FORMAT_MESSAGE_FROM_SYSTEM |
     FORMAT_MESSAGE_IGNORE_INSERTS,
     NULL,
-    last_error,
+    error,
     MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
     (char*)&message_buffer,
     0, NULL);
@@ -131,7 +142,6 @@ typedef struct winpipe_stream {
 
 // Represents a single read from the pipe.
 typedef struct winpipe_read {
-  uint8_t bytes[64 * 1024];
   grpc_slice slice;
   winpipe_slice_byte_stream* stream;
   grpc_closure* on_complete;
@@ -146,7 +156,7 @@ static winpipe_read* winpipe_read_malloc(
   if (NULL == read) {
     return NULL;
   }
-  read->slice = grpc_slice_new(read->bytes, sizeof(read->bytes), free);
+  read->slice = grpc_slice_malloc(64 * 1024);
   read->stream = stream;
   read->on_complete = on_complete;
   ZeroMemory(&read->overlapped, sizeof(read->overlapped));
@@ -154,11 +164,19 @@ static winpipe_read* winpipe_read_malloc(
   return read;
 }
 
-static VOID WINAPI on_next_complete(
-  _In_    DWORD dwErrorCode,
-  _In_    DWORD dwNumberOfBytesTransfered,
-  _Inout_ LPOVERLAPPED lpOverlapped) {
-
+static VOID WINAPI on_winpipe_slice_byte_stream_next_complete(
+  _In_    DWORD error_code,
+  _In_    DWORD bytes_transferred,
+  _Inout_ LPOVERLAPPED overlapped) 
+{
+  winpipe_read* read = (winpipe_read*)overlapped;
+  grpc_slice_buffer_addn(&read->stream->slice_buffer, &read->slice, 
+    bytes_transferred);
+  grpc_slice_unref(read->slice);
+  free(read);
+  if (ERROR_SUCCESS != error_code) {
+    WINPIPE_LOG_ERROR(error_code);
+  }
 }
 
 static bool winpipe_slice_byte_stream_next(grpc_exec_ctx *exec_ctx,
@@ -166,17 +184,11 @@ static bool winpipe_slice_byte_stream_next(grpc_exec_ctx *exec_ctx,
   grpc_closure *on_complete) {
   winpipe_slice_byte_stream *stream = (winpipe_slice_byte_stream *)bs;
   winpipe_read* read = winpipe_read_malloc(stream, on_complete);
-  bool done = ReadFileEx(stream->pipe_handle,
+  bool succeeded = ReadFileEx(stream->pipe_handle,
     GRPC_SLICE_START_PTR(read->slice), GRPC_SLICE_LENGTH(read->slice),
-    &read->overlapped, &on_next_complete);
-  if (done) {
-    // Takes ownership of slice AND the read struct.
-    grpc_slice_buffer_add(&stream->slice_buffer, read->slice);
-    grpc_slice_unref(read->slice);
-    return true;
-  }
+    &read->overlapped, &on_winpipe_slice_byte_stream_next_complete);
   DWORD error = GetLastError();
-  if (WAIT_IO_COMPLETION == error) {
+  if (ERROR_SUCCESS == error) {
     return false;
   } else {
     WINPIPE_LOG_LAST_ERROR();
